@@ -85,44 +85,42 @@ This section details potential vulnerabilities related to arithmetic operations,
 
 ---
 
-### **CALC-007: `deep_price::add_price_point` - `cumulative_base`/`quote` `u64` Overflow/Underflow**
+### **CALC-007: `deep_price::add_price_point` - `cumulative_base/quote` `u64` Overflow/Underflow and Pruning Logic**
 
-*   **Module & Function**: `deepbook::deep_price::add_price_point` (called by `deepbook::pool::add_deep_price_point`)
+*   **Module & Function**: `deepbook::deep_price::add_price_point`
 *   **Affected Variables/State**: `DeepPrice::cumulative_base` (u64), `DeepPrice::cumulative_quote` (u64), and subsequently the calculated `deep_per_asset` oracle price.
 
-*   **Potential Issue 1: Overflow**
-    *   **Description**: The `conversion_rate` (u64, a scaled price derived from a reference pool) is added to `self.cumulative_base` or `self.cumulative_quote` (both u64). Since `MAX_DATA_POINTS` is 100, if an attacker can repeatedly feed high `conversion_rate` values, the cumulative sum can exceed `u64::MAX` and overflow (wrap around to a small value).
-    *   **Exploit Path Confirmation**:
-        1.  **Attacker Influence**: An attacker needs to manipulate the `mid_price` of a whitelisted and registered `reference_pool`. The `conversion_rate` passed to `add_price_point` is `deep_per_reference_other_price`.
-            *   If reference pool is DEEP/OtherAsset (e.g., DEEP/USDC, so `reference_deep_is_base` is true in `pool::add_deep_price_point`), `conversion_rate = math::div(FLOAT_SCALING, reference_pool_price)`. To make `conversion_rate` large, `reference_pool_price` (USDC per DEEP * FS) must be made very small (e.g., by making DEEP appear extremely valuable). Max `conversion_rate` can be `FLOAT_SCALING^2 / MIN_PRICE ~= 10^18` (fits `u64`).
-            *   If reference pool is OtherAsset/DEEP (e.g., USDC/DEEP, so `reference_deep_is_base` is false), `conversion_rate = reference_pool_price`. To make `conversion_rate` large, `reference_pool_price` (DEEP per USDC * FS) must be made very large. Max `reference_pool_price` is `constants::max_price()`, which is `(2^63-1)`.
-        2.  **Triggering Overflow**: An attacker (or anyone) calls `pool::add_deep_price_point` for the target pool, using the manipulated reference pool. This call must respect the `MIN_DURATION_BETWEEN_DATA_POINTS_MS` (1 minute).
-            *   If `conversion_rate` can be consistently pushed to `(u64::MAX / N)` where N is less than `MAX_DATA_POINTS` (100), an overflow is possible. For instance, if `conversion_rate` is `u64::MAX / 50`, then 50 such additions (over ~50 minutes) would cause an overflow. Given `conversion_rate` can reach `~10^18` and `u64::MAX` is `~1.8*10^19`, even 2-3 additions of maxed out (or near maxed out) `conversion_rate` values can cause overflow.
-        3.  **Outcome**: `cumulative_base` (or `quote`) wraps around to a very small value. The subsequent calculation in `calculate_order_deep_price`, `deep_per_asset = cumulative_asset / asset_length`, results in an extremely low (but potentially non-zero) oracle price for DEEP relative to the pool's base/quote asset.
-    *   **Ultimate Impact**:
-        *   **Near-Zero Fees**: If this manipulated low `deep_per_asset` is used in `OrderDeepPrice::fee_quantity`, the calculated DEEP fee amount becomes negligible or zero.
-        *   This allows any user (including the attacker) to trade in the target pool with significantly reduced or no DEEP fees, causing a loss of protocol revenue.
-        *   If fees are instead paid with input tokens (because `deep_per_asset` becomes 0), the `constants::fee_penalty_multiplier()` applies, but this scenario focuses on manipulating the DEEP fee pathway.
+*   **Issue 1: Overflow of `cumulative_base`/`cumulative_quote`**
+    *   **Description**: `self.cumulative_base = self.cumulative_base + conversion_rate;` (similarly for quote) can overflow `u64`.
+    *   **Verification**: Confirmed. `conversion_rate` can be a large `u64` (up to `~10^18` or `~0.9*10^19` based on `constants::max_price()`). Summing even 2-3 such large values, or ~18 values of `10^18`, will exceed `u64::MAX (~1.8*10^19)`. This is possible within the `MAX_DATA_POINTS` (100) window.
+    *   **Exploit Path**:
+        1.  Attacker manipulates a whitelisted `reference_pool` to make its `mid_price` such that the derived `conversion_rate` for `add_price_point` is very high (e.g., close to `u64::MAX / k` where `k` is a small integer like 2 or 3).
+        2.  Attacker or any user calls `pool::add_deep_price_point` for the target pool repeatedly (respecting the 1-minute `MIN_DURATION_BETWEEN_DATA_POINTS_MS`).
+        3.  After `k` such calls, `cumulative_base` (or `quote`) overflows and wraps to a small value.
+        4.  `calculate_order_deep_price` then computes `deep_per_asset = small_wrapped_cumulative / asset_prices.length()`, resulting in an artificially very low oracle price.
+    *   **Impact**: **High Severity**. Leads to near-zero DEEP fee calculations for trades in the target pool, causing loss of protocol revenue.
     *   **Mitigations**:
-        *   `MIN_DURATION_BETWEEN_DATA_POINTS_MS`: Slows the attack but doesn't prevent it.
-        *   `MAX_DATA_POINTS` & `MAX_DATA_POINT_AGE_MS`: Old malicious data points will eventually be pruned, allowing the average to self-correct if manipulation stops.
-        *   Reference pool whitelisting: Provides some trust but doesn't prevent manipulation of a whitelisted pool's market.
-        *   **Missing/Insufficient**: `cumulative_base` and `cumulative_quote` should ideally be `u128` or `u256` to make overflow from summing `MAX_DATA_POINTS` (100) `u64` values practically impossible.
+        *   `MIN_DURATION_BETWEEN_DATA_POINTS_MS` (1 minute) slows the attack but does not prevent it.
+        *   `MAX_DATA_POINTS` (100) & `MAX_DATA_POINT_AGE_MS` (e.g., 1 day) mean old malicious data points will eventually be pruned, allowing the average to self-correct if manipulation stops.
+        *   Reference pool whitelisting provides some trust but doesn't prevent manipulation of a whitelisted pool's market if the whitelisted pool itself is vulnerable or thinly traded.
+        *   **Insufficient**: `cumulative_base` and `cumulative_quote` should be `u128` to make overflow from summing `MAX_DATA_POINTS` (100) `u64` values practically impossible.
 
-*   **Potential Issue 2: Underflow**
-    *   **Description**: When pruning old price points, the code executes `self.cumulative_base = self.cumulative_base - asset_prices[0].conversion_rate`. If the `asset_prices[0].conversion_rate` (oldest price) is larger than the current `self.cumulative_base` (which might be low due to recent low price entries), this `u64` subtraction will panic due to underflow.
-    *   **Exploit Path Confirmation**:
-        1.  **Attacker Influence**: Manipulate `reference_pool.mid_price()` to feed `add_price_point`.
-        2.  **Step 1 (Inflate then Deflate)**: Add one or more price points with a very high `conversion_rate` (`P_high`).
-        3.  Wait for `MIN_DURATION_BETWEEN_DATA_POINTS_MS` between some calls if needed.
-        4.  Add multiple subsequent price points with a very low `conversion_rate` (`P_low`, e.g., 1). This fills up the `asset_prices` vector, pushing `P_high` towards index 0. The `cumulative_base` would be `P_high + sum(P_low_values)`.
-        5.  **Step 2 (Trigger Pruning & Underflow)**: Let enough time pass so `P_high` (now at `asset_prices[0]`) becomes older than `MAX_DATA_POINT_AGE_MS`. Or, add one more `P_low` data point so `asset_prices.length() == MAX_DATA_POINTS + 1`.
-        6.  The pruning logic in `add_price_point` will attempt `self.cumulative_base -= P_high`. If `P_high` is greater than the current `cumulative_base` (which is plausible if `P_high` was very large and subsequent prices were very small, and other large initial prices were already pruned), this subtraction panics.
-    *   **Ultimate Impact**:
-        *   **Denial of Service (DoS)**: The call to `pool::add_deep_price_point` for the affected asset (base or quote) will consistently fail due to the panic. This prevents the oracle price for that asset from being updated.
-        *   **Stale Oracle Price**: The `deep_per_asset` will become stale, leading to increasingly inaccurate fee calculations over time as the market moves but the oracle doesn't. This can lead to over or undercharging fees.
+*   **Issue 2: Underflow of `cumulative_base`/`cumulative_quote` during Pruning**
+    *   **Description**: `self.cumulative_base = self.cumulative_base - asset_prices[0].conversion_rate;` (similarly for quote) can panic if `asset_prices[0].conversion_rate` is greater than the current `self.cumulative_base`.
+    *   **Verification**: Confirmed. This can occur if a very large historical price point (`P_high`) is at the head of the `asset_prices` vector (due to be pruned by age or vector size limit) and the `cumulative_base` has become small due to subsequent additions of very small price points (`P_low`) or pruning of other initial large values.
+    *   **Exploit Path**:
+        1.  Attacker adds one or more `P_high` price points (large `conversion_rate`).
+        2.  Attacker then adds multiple `P_low` price points (e.g., `conversion_rate` = 1) until `P_high` is at `asset_prices[0]`. The `cumulative_base` would be approximately `P_high + sum_of_some_P_lows - sum_of_any_other_pruned_values`.
+        3.  Attacker triggers another `add_price_point` when `P_high` is eligible for pruning (either `asset_prices` is full at `MAX_DATA_POINTS`, or `P_high`'s timestamp is older than `MAX_DATA_POINT_AGE_MS`).
+        4.  If current `cumulative_base` is less than `P_high` (plausible if `P_high` was very large and many subsequent prices were small, or other initial large values were already pruned), the subtraction `self.cumulative_base - P_high` panics.
+    *   **Impact**: **High Severity**. Causes `pool::add_deep_price_point` to panic, leading to a Denial of Service for oracle updates for that asset (base or quote). This results in a stale oracle price and inaccurate fees.
     *   **Mitigations**:
-        *   **Missing/Insufficient**: Using `u128` for `cumulative_base`/`quote` would make it much harder for a single old data point to be larger than the cumulative sum of up to 100 data points. A saturating subtraction (`self.cumulative_base = self.cumulative_base.saturating_sub(value)`) would prevent panic but might lead to `cumulative_base` becoming 0, skewing the average significantly (though perhaps better than a DoS). The best fix is a larger type for the cumulative sum.
+        *   Move's default panic on underflow prevents silent corruption.
+        *   **Insufficient**: Using `u128` for `cumulative_base` and `cumulative_quote` would make it much harder for a single old data point to be larger than the cumulative sum of up to 100 `u64` data points. A saturating subtraction (`saturating_sub`) would prevent the panic but could lead to `cumulative_base` becoming 0 if `P_high` is larger, which would significantly skew the average (though perhaps preferable to a DoS). A larger type for cumulative sums is the more robust fix.
+
+*   **Note on LIV-001 (Pruning Loop Panic from Empty Vector Access)**: The `while` loop condition for pruning is `asset_prices.length() > MAX_DATA_POINTS || (asset_prices.length() > 0 && asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp)`. The `asset_prices.length() > 0` check before `asset_prices[0]` access acts as a short-circuit guard. Therefore, the specific panic described in LIV-001 (accessing index 0 of an empty vector *within the loop condition itself*) is **prevented by this short-circuiting logic**. The primary remaining risk during pruning is the underflow described in "Issue 2" above. LIV-001 can be considered superseded/covered by this analysis of CALC-007.
+
+*   **Overall Attacker Requirements for CALC-007**: Ability to significantly influence the `mid_price` of a whitelisted, registered reference pool over a period of minutes to hours to feed extreme `conversion_rate` values into the oracle.
 
 ---
 
@@ -227,42 +225,5 @@ This section details potential vulnerabilities related to arithmetic operations,
         *   `asset_length = self.quote_prices.length();`
         *   Similarly, the `ENoDataPoints` assert ensures `quote_prices` is non-empty if it's selected (because `last_insert_timestamp(false)` would be `> 0`). Thus, `asset_length > 0`.
     *   The `ENoDataPoints` assert, combined with the logic for choosing which price vector's data to use, effectively ensures that `asset_length` will be greater than zero because an empty vector would not be chosen if a non-empty one exists, and the assert guarantees at least one is non-empty.
-
----
-
-## Logic and State Vulnerabilities
-
-This section details potential vulnerabilities related to flawed business logic, state management inconsistencies, or unexpected state transitions.
-
----
-
-### **LIV-001: Panic in `deep_price::add_price_point` Pruning Loop**
-
-*   **Module & Function**: `deepbook::deep_price::add_price_point`
-*   **Affected Variables/State**: The `DeepPrice` object's `base_prices` or `quote_prices` vectors.
-*   **Potential Issue**: The `while` loop responsible for pruning old or excess price data points can attempt to access `asset_prices[0]` when `asset_prices` has become empty due to previous `asset_prices.remove(0)` calls within the same loop. This occurs if multiple conditions for removal are met sequentially, emptying the vector before the loop condition re-evaluates its first clause (`asset_prices.length() > MAX_DATA_POINTS`).
-*   **Exploit Path Confirmation**:
-    1.  Precondition: `MAX_DATA_POINTS` is set (e.g., to 1 for testing, or 100 in production).
-    2.  Scenario:
-        *   Assume `is_base_conversion` is true. `base_prices` (aliased as `asset_prices` in the loop) initially contains `MAX_DATA_POINTS` entries. All these entries are old enough such that `asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp` is true for each of them if they were at index 0.
-        *   A new price point is added, so `asset_prices.push_back(new_price_data)`. Now, `asset_prices.length()` is `MAX_DATA_POINTS + 1`.
-        *   The `while` loop starts: `while (asset_prices.length() > MAX_DATA_POINTS || (asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp))`.
-        *   **First Iteration**: `asset_prices.length() > MAX_DATA_POINTS` (e.g., 101 > 100) is true. The loop body executes. `asset_prices.remove(0)` is called. `asset_prices.length()` is now `MAX_DATA_POINTS` (e.g., 100).
-        *   **Loop Condition Re-evaluation**: `asset_prices.length() > MAX_DATA_POINTS` (100 > 100) is false.
-        *   The second part of the OR condition is evaluated: `(asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp)`. This accesses `asset_prices[0]`.
-        *   **Subsequent Iterations (Problematic Case)**: If *all* the original `MAX_DATA_POINTS` entries were also old enough to be pruned by the *second* condition:
-            *   The loop continues because `asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp` is true.
-            *   `asset_prices.remove(0)` is called repeatedly.
-            *   If this happens `MAX_DATA_POINTS` times, `asset_prices` becomes empty.
-            *   The `while` loop condition is checked again: `asset_prices.length() > MAX_DATA_POINTS` (0 > 100) is false.
-            *   The second part of the OR condition `(asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp)` attempts to access `asset_prices[0]` on an **empty vector**.
-            *   This results in a panic (vector access out of bounds).
-*   **Ultimate Impact**: Denial of Service (DoS) for the `pool::add_deep_price_point` function. This prevents the oracle price for the affected asset (base or quote) from being updated. Consequently, fee calculations relying on this oracle may become stale and inaccurate.
-*   **Mitigations**:
-    *   The loop condition should explicitly check `!asset_prices.is_empty()` *before* attempting to access `asset_prices[0]`. A robust condition would be:
-        `while ((asset_prices.length() > MAX_DATA_POINTS && !asset_prices.is_empty()) || (!asset_prices.is_empty() && asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp))`
-        A simpler, correct form:
-        `while (!asset_prices.is_empty() && (asset_prices.length() > MAX_DATA_POINTS || asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp))`
-    *   Alternatively, an `if (asset_prices.is_empty()) { break; }` check at the very beginning *inside* the loop body would also prevent the panic.
 
 ---
