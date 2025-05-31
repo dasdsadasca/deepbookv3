@@ -11,21 +11,24 @@ This section details potential vulnerabilities related to arithmetic operations,
 ### **CALC-001: `Account::total_volume()` u128 Overflow**
 
 *   **Module & Function**: `account.move` (within `pool` module) - `Account::total_volume()`
-*   **Potential Issue**: The function calculates total volume by summing `self.base_volume_total` and `self.quote_volume_total_in_base_asset`, both of which are `u128`. If the sum `base_volume_total + quote_volume_total_in_base_asset` exceeds the maximum value for a `u128` integer, an arithmetic overflow will occur.
-*   **Affected Variables/State**: The return value of `total_volume()`. This function is used in `history::calculate_rebate_amount` to determine user rebates.
-*   **Potential Impact**: If an overflow occurs, the returned `total_volume` will be a much smaller, wrapped-around value. This would lead to an incorrect (likely much lower) rebate calculation for the user, potentially causing a loss of earned rebates.
+*   **Potential Issue**: The function calculates total volume by summing `self.base_volume_total` and `self.quote_volume_total_in_base_asset`, both of which are `u128`. If the sum exceeds `u128::MAX`, an overflow occurs.
+*   **Affected Variables/State**: Return value of `total_volume()`.
+*   **Severity**: **Low Severity / Not Practically Exploitable**
+*   **Analysis & Exploit Path Confirmation**: While `base_volume_total + quote_volume_total_in_base_asset` can theoretically overflow `u128`, the required cumulative volume for a single account within a single epoch (e.g., `> 3.4e38` if assets are scaled by `1e9`) is practically unattainable with current blockchain transaction limits and typical asset scales. An overflow would cause a panic due to Move's default arithmetic checks.
+*   **Impact (Theoretical)**: Panic during `total_volume()` call if it were to overflow, potentially affecting fee tier calculations or other logic that might use it, leading to transaction reversion.
+*   **Mitigations**: The sheer size of `u128` is the primary mitigating factor against practical exploits. Standard panic on overflow prevents silent data corruption.
 
 ---
 
 ### **CALC-002: `Account` Volume Accumulation u128 Overflow**
 
 *   **Module & Function**: `account.move` (within `pool` module) - `Account::process_maker_fill()`, `Account::add_taker_volume()`
-*   **Potential Issue**:
-    *   In `process_maker_fill`, `self.base_volume_total` and `self.quote_volume_total_in_base_asset` are incremented.
-    *   In `add_taker_volume`, `self.base_volume_total` and `self.quote_volume_total_in_base_asset` are incremented.
-    These increments (`+=`) on `u128` typed fields can overflow if a user's accumulated volume becomes excessively large.
-*   **Affected Variables/State**: `account.base_volume_total`, `account.quote_volume_total_in_base_asset` within the `Account` struct.
-*   **Potential Impact**: An overflow would cause the user's recorded trading volume to wrap around to a much smaller value. This would impact any logic that relies on accurate total volume, such as fee tier calculations, rebate distributions, and potentially governance power if volume is a factor. Users might receive incorrect fee rates or lower rebates than deserved.
+*   **Potential Issue**: Increments (`+=`) to `self.base_volume_total` or `self.quote_volume_total_in_base_asset` (both `u128`) can overflow.
+*   **Affected Variables/State**: `account.base_volume_total`, `account.quote_volume_total_in_base_asset`.
+*   **Severity**: **Low Severity / Not Practically Exploitable**
+*   **Analysis & Exploit Path Confirmation**: Similar to CALC-001, a single account accumulating enough trading volume (base or quote, scaled) within one epoch to overflow a `u128` field is practically infeasible.
+*   **Impact (Theoretical)**: Panic during the volume update operation (e.g., in `process_maker_fill` or `add_taker_volume`), reverting the transaction that caused the overflow. This would prevent the trade from being recorded for that user if it hit the theoretical limit.
+*   **Mitigations**: The size of `u128`. Standard panic on overflow.
 
 ---
 
@@ -38,50 +41,89 @@ This section details potential vulnerabilities related to arithmetic operations,
 
 ---
 
-### **CALC-004: `Balances::add_balances` u64 Overflow**
+### **CALC-004: `Balances::add_balances` u64 Overflow (Core Issue for Stake Accumulation)**
 
-*   **Module & Function**: `balances.move` (within `pool` module) - `Balances::add_balances()`, and by extension `add_base()`, `add_quote()`, `add_deep()`.
-*   **Potential Issue**: The `add_balances` function, and the specific asset addition functions it calls (`add_base`, `add_quote`, `add_deep`), perform addition on `u64` fields (e.g., `self.base_total += amount`). If the `amount` being added to an existing total (e.g., `self.base_total`) causes the sum to exceed the `u64` maximum, an overflow will occur.
-*   **Affected Variables/State**: `balances.base_total`, `balances.quote_total`, `balances.deep_total` within the `Balances` struct, which tracks the pool's overall asset totals. Also affects `account_balances.base_balance`, `account_balances.quote_balance`, `account_balances.deep_balance` within the `AccountBalances` struct, which tracks a user's balances within the `BalanceManager`.
-*   **Potential Impact**:
-    *   **Pool Accounting**: If `Pool::Balances` overflows, the pool's internal accounting of its total assets becomes incorrect. This could disrupt pool operations or lead to inconsistencies.
-    *   **User Balances**: If `BalanceManager::AccountBalances` overflows during deposit or settlement, the user's recorded balance will be incorrect (lower than actual), potentially leading to a loss of funds for the user when they attempt to withdraw or use these balances.
+*   **Module & Function**: `deepbook::balances::add_balances` (and helpers `add_base`, `add_quote`, `add_deep`). Also impacts multiple functions in `deepbook::account` that call these (e.g., `process_maker_fill`, `add_settled_balances`, `add_owed_balances`, `claim_rebates`, `add_stake`, `remove_stake`).
+*   **Potential Issue**: Direct `u64 + u64` addition for `base`, `quote`, or `deep` fields within the `Balances` struct can overflow if the sum exceeds `u64::MAX`. This is a general issue affecting many balance update operations.
+*   **Affected Variables/State**: `Balances::base_total`, `Balances::quote_total`, `Balances::deep_total`. Also `AccountBalances` fields within `BalanceManager`, and `Account::active_stake`, `Account::inactive_stake`, `Account::settled_balances`, `Account::owed_balances`.
+*   **Exploit Path Confirmation & Impact**:
+    *   **General DoS**: If any balance component (e.g., `settled_balances.base` in `Account`) is close to `u64::MAX`, and a transaction attempts to add even a small amount (e.g., via `add_base`) that would cause an overflow, the transaction will panic (due to Move's default overflow checks on `+`). This can lead to a Denial of Service for the affected user for operations that try to update these balances (e.g., receiving fills, claiming rebates, staking). The user might be unable to interact further with the pool for that asset or operation.
+    *   **CALC-003 (Fund Loss via `Account::remove_stake` - Specific instance of CALC-004's broader issue)**:
+        *   **Exploit**:
+            1. A user's `active_stake` and `inactive_stake` in `Account` struct are both `u64`.
+            2. In `account::remove_stake()`, `stake_before = self.active_stake + self.inactive_stake;` is calculated. If `active_stake` is, for example, `u64::MAX - 100` and `inactive_stake` is `200`, their sum overflows `u64` and wraps around to a small value (e.g., `99`).
+            3. This wrapped-around, small `stake_before` value is then passed to `self.settled_balances.add_deep(stake_before)`.
+            4. The `Balances::add_deep` function itself might not overflow here if `settled_balances.deep` was small, but it's adding the *wrong, much smaller* amount to the user's settled DEEP balance.
+        *   **Ultimate Impact (CALC-003)**: When the user subsequently withdraws their funds from `BalanceManager` (which reads from these `settled_balances`), the `Vault` will only transfer this small, wrapped-around DEEP amount from `settled_balances` to their `BalanceManager`. This results in a **direct and permanent loss of the majority of the user's staked DEEP tokens**. Any user whose total stake (`active + inactive`) approaches or exceeds `u64::MAX` is vulnerable when calling `remove_stake`.
+        *   **Attacker Capability (CALC-003)**: This can be triggered by the user themselves when unstaking if their stake is sufficiently large. An attacker cannot directly cause this for another user unless they can influence the victim's stake amounts to reach overflow conditions prior to the victim calling `remove_stake`.
+*   **Mitigations**:
+    *   Move's panic on overflow is a default safety feature preventing silent corruption, but it leads to DoS in many cases.
+    *   **Missing/Insufficient**: The `base`, `quote`, and `deep` fields within the `Balances` struct (and consequently fields like `active_stake`, `inactive_stake` in `Account` that are summed up before being added to `Balances`) should ideally be `u128` to significantly reduce the likelihood of overflow for token amounts. For sums like `active_stake + inactive_stake` before they are used with `Balances` functions (as in `remove_stake`), the sum should be performed into a `u128` temporary variable to prevent overflow before further processing or before being passed to a `Balances` function that expects a `u64` amount (if `Balances` fields remain `u64`).
 
 ---
 
 ### **CALC-005: `history::calculate_rebate_amount` Division by Zero**
 
 *   **Module & Function**: `history.move` (within `pool` module) - `history::calculate_rebate_amount()`
-*   **Potential Issue**: The function calculates rebates using `math::div_u128(..., volumes.historic_median, ...)`. If `volumes.historic_median` (which is a `u64` value representing the median trading volume) is zero, this will lead to a division by zero error.
-*   **Affected Variables/State**: The rebate calculation process.
-*   **Potential Impact**: A division by zero would cause the transaction to fail. If this occurs during a critical process like end-of-epoch rebate distribution, it could prevent all users from receiving their rebates for that epoch, leading to a denial of service for rebate claims. This might happen if a pool has very little or no trading activity for a period, causing the median volume to be calculated as zero.
+*   **Potential Issue**: The function calculates rebates using `math::div_u128(..., volumes.historic_median, ...)`. If `volumes.historic_median` (which is a `u64` value representing the median trading volume) is zero, this could lead to a division by zero error.
+*   **Affected Variables/State**: The rebate calculation process, `maker_rebate_percentage`.
+*   **Potential Impact (if not mitigated)**: A division by zero would cause the transaction to fail. If this occurs during a critical process like end-of-epoch rebate distribution, it could prevent all users from receiving their rebates for that epoch, leading to a denial of service for rebate claims.
+*   **Status**: **Mitigated**
+*   **Mitigation Explanation**: The function includes a specific check: `if (volumes.historic_median > 0)`. If `volumes.historic_median` is 0, `maker_rebate_percentage` is explicitly set to 0. This avoids the division by zero and correctly results in zero rebates being calculated, preventing a panic and ensuring the function behaves as intended in a zero median volume scenario.
 
 ---
 
 ### **CALC-006: `history::add_volume` u128 Overflows**
 
 *   **Module & Function**: `history.move` (within `pool` module) - `history::add_volume()`
-*   **Potential Issue**: This function updates several `u128` fields by addition:
-    *   `current_epoch_history.total_volume += volume`
-    *   `current_epoch_history.total_staked_volume += staked_volume`
-    *   `global_history.total_volume += volume`
-    *   `global_history.total_staked_volume += staked_volume`
-    Any of these additions could overflow if the accumulated totals become excessively large.
+*   **Potential Issue**: This function updates `u128` fields like `current_epoch_history.total_volume`, `current_epoch_history.total_staked_volume`, etc., by addition. These additions could theoretically overflow.
 *   **Affected Variables/State**: `total_volume` and `total_staked_volume` fields within `EpochHistory` and `GlobalHistory` structs.
-*   **Potential Impact**: Overflowing these historical accumulators would lead to incorrect historical data. This could impact future calculations that rely on this history, such as average volumes, rebate calculations if they use global history, or any analytics/dashboarding features. The immediate impact might be less direct than fund loss but corrupts important long-term pool metrics.
+*   **Severity**: **Low Severity / Not Practically Exploitable**
+*   **Analysis & Exploit Path Confirmation**: Accumulating `total_volume` or `total_staked_volume` for an entire pool to overflow `u128` within a single epoch (or even across many epochs for global history, though epochs reset `current_epoch_history`) is practically infeasible given transaction limits and realistic market volumes. The value `u128::MAX` is astronomically large.
+*   **Impact (Theoretical)**: Panic during the `add_volume` call if an overflow were to occur, reverting the transaction. This could potentially disrupt the recording of historical data for that transaction, but the conditions for such an overflow are not realistic.
+*   **Mitigations**: The size of `u128`. Standard panic on overflow.
 
 ---
 
-### **CALC-007: `deep_price::add_price_point` Overflows/Underflows**
+### **CALC-007: `deep_price::add_price_point` - `cumulative_base`/`quote` `u64` Overflow/Underflow**
 
-*   **Module & Function**: `deep_price.move` (within `pool` module) - `deep_price::add_price_point()`
-*   **Potential Issue**:
-    *   **Overflow**: The lines `state.cumulative_base_price += conversion_rate_base_per_quote;` and `state.cumulative_quote_price += conversion_rate_quote_per_base;` involve adding a `u64` `conversion_rate` to a `u64` cumulative price. This can overflow if the cumulative price becomes very large.
-    *   **Underflow**: The lines `state.cumulative_base_price -= old_rate_base;` and `state.cumulative_quote_price -= old_rate_quote;` (when removing an old price point to maintain a window) involve subtracting a `u64` `old_rate` from a `u64` cumulative price. If `old_rate` is larger than the current `cumulative_price` (which shouldn't happen in normal operation but could due to other bugs or extreme data), this would underflow.
-*   **Affected Variables/State**: `state.cumulative_base_price` and `state.cumulative_quote_price` within the `PriceOracleState` struct.
-*   **Potential Impact**:
-    *   **Overflow**: Would lead to an incorrect, wrapped-around cumulative price, making the oracle's time-weighted average price (TWAP) calculations completely wrong. This could be exploited by other protocols relying on this oracle for pricing.
-    *   **Underflow**: Would also lead to a wildly incorrect cumulative price and thus an erroneous TWAP. This could similarly be exploited or cause malfunctions in systems relying on the oracle.
+*   **Module & Function**: `deepbook::deep_price::add_price_point` (called by `deepbook::pool::add_deep_price_point`)
+*   **Affected Variables/State**: `DeepPrice::cumulative_base` (u64), `DeepPrice::cumulative_quote` (u64), and subsequently the calculated `deep_per_asset` oracle price.
+
+*   **Potential Issue 1: Overflow**
+    *   **Description**: The `conversion_rate` (u64, a scaled price derived from a reference pool) is added to `self.cumulative_base` or `self.cumulative_quote` (both u64). Since `MAX_DATA_POINTS` is 100, if an attacker can repeatedly feed high `conversion_rate` values, the cumulative sum can exceed `u64::MAX` and overflow (wrap around to a small value).
+    *   **Exploit Path Confirmation**:
+        1.  **Attacker Influence**: An attacker needs to manipulate the `mid_price` of a whitelisted and registered `reference_pool`. The `conversion_rate` passed to `add_price_point` is `deep_per_reference_other_price`.
+            *   If reference pool is DEEP/OtherAsset (e.g., DEEP/USDC, so `reference_deep_is_base` is true in `pool::add_deep_price_point`), `conversion_rate = math::div(FLOAT_SCALING, reference_pool_price)`. To make `conversion_rate` large, `reference_pool_price` (USDC per DEEP * FS) must be made very small (e.g., by making DEEP appear extremely valuable). Max `conversion_rate` can be `FLOAT_SCALING^2 / MIN_PRICE ~= 10^18` (fits `u64`).
+            *   If reference pool is OtherAsset/DEEP (e.g., USDC/DEEP, so `reference_deep_is_base` is false), `conversion_rate = reference_pool_price`. To make `conversion_rate` large, `reference_pool_price` (DEEP per USDC * FS) must be made very large. Max `reference_pool_price` is `constants::max_price()`, which is `(2^63-1)`.
+        2.  **Triggering Overflow**: An attacker (or anyone) calls `pool::add_deep_price_point` for the target pool, using the manipulated reference pool. This call must respect the `MIN_DURATION_BETWEEN_DATA_POINTS_MS` (1 minute).
+            *   If `conversion_rate` can be consistently pushed to `(u64::MAX / N)` where N is less than `MAX_DATA_POINTS` (100), an overflow is possible. For instance, if `conversion_rate` is `u64::MAX / 50`, then 50 such additions (over ~50 minutes) would cause an overflow. Given `conversion_rate` can reach `~10^18` and `u64::MAX` is `~1.8*10^19`, even 2-3 additions of maxed out (or near maxed out) `conversion_rate` values can cause overflow.
+        3.  **Outcome**: `cumulative_base` (or `quote`) wraps around to a very small value. The subsequent calculation in `calculate_order_deep_price`, `deep_per_asset = cumulative_asset / asset_length`, results in an extremely low (but potentially non-zero) oracle price for DEEP relative to the pool's base/quote asset.
+    *   **Ultimate Impact**:
+        *   **Near-Zero Fees**: If this manipulated low `deep_per_asset` is used in `OrderDeepPrice::fee_quantity`, the calculated DEEP fee amount becomes negligible or zero.
+        *   This allows any user (including the attacker) to trade in the target pool with significantly reduced or no DEEP fees, causing a loss of protocol revenue.
+        *   If fees are instead paid with input tokens (because `deep_per_asset` becomes 0), the `constants::fee_penalty_multiplier()` applies, but this scenario focuses on manipulating the DEEP fee pathway.
+    *   **Mitigations**:
+        *   `MIN_DURATION_BETWEEN_DATA_POINTS_MS`: Slows the attack but doesn't prevent it.
+        *   `MAX_DATA_POINTS` & `MAX_DATA_POINT_AGE_MS`: Old malicious data points will eventually be pruned, allowing the average to self-correct if manipulation stops.
+        *   Reference pool whitelisting: Provides some trust but doesn't prevent manipulation of a whitelisted pool's market.
+        *   **Missing/Insufficient**: `cumulative_base` and `cumulative_quote` should ideally be `u128` or `u256` to make overflow from summing `MAX_DATA_POINTS` (100) `u64` values practically impossible.
+
+*   **Potential Issue 2: Underflow**
+    *   **Description**: When pruning old price points, the code executes `self.cumulative_base = self.cumulative_base - asset_prices[0].conversion_rate`. If the `asset_prices[0].conversion_rate` (oldest price) is larger than the current `self.cumulative_base` (which might be low due to recent low price entries), this `u64` subtraction will panic due to underflow.
+    *   **Exploit Path Confirmation**:
+        1.  **Attacker Influence**: Manipulate `reference_pool.mid_price()` to feed `add_price_point`.
+        2.  **Step 1 (Inflate then Deflate)**: Add one or more price points with a very high `conversion_rate` (`P_high`).
+        3.  Wait for `MIN_DURATION_BETWEEN_DATA_POINTS_MS` between some calls if needed.
+        4.  Add multiple subsequent price points with a very low `conversion_rate` (`P_low`, e.g., 1). This fills up the `asset_prices` vector, pushing `P_high` towards index 0. The `cumulative_base` would be `P_high + sum(P_low_values)`.
+        5.  **Step 2 (Trigger Pruning & Underflow)**: Let enough time pass so `P_high` (now at `asset_prices[0]`) becomes older than `MAX_DATA_POINT_AGE_MS`. Or, add one more `P_low` data point so `asset_prices.length() == MAX_DATA_POINTS + 1`.
+        6.  The pruning logic in `add_price_point` will attempt `self.cumulative_base -= P_high`. If `P_high` is greater than the current `cumulative_base` (which is plausible if `P_high` was very large and subsequent prices were very small, and other large initial prices were already pruned), this subtraction panics.
+    *   **Ultimate Impact**:
+        *   **Denial of Service (DoS)**: The call to `pool::add_deep_price_point` for the affected asset (base or quote) will consistently fail due to the panic. This prevents the oracle price for that asset from being updated.
+        *   **Stale Oracle Price**: The `deep_per_asset` will become stale, leading to increasingly inaccurate fee calculations over time as the market moves but the oracle doesn't. This can lead to over or undercharging fees.
+    *   **Mitigations**:
+        *   **Missing/Insufficient**: Using `u128` for `cumulative_base`/`quote` would make it much harder for a single old data point to be larger than the cumulative sum of up to 100 data points. A saturating subtraction (`self.cumulative_base = self.cumulative_base.saturating_sub(value)`) would prevent panic but might lead to `cumulative_base` becoming 0, skewing the average significantly (though perhaps better than a DoS). The best fix is a larger type for the cumulative sum.
+
 ---
 
 ### **CALC-008: `Account::update()` u64 Stake Overflow**
@@ -90,47 +132,58 @@ This section details potential vulnerabilities related to arithmetic operations,
 *   **Potential Issue**: During an epoch change, this function calculates `let total_stake = self.active_stake + self.inactive_stake;`. Both `active_stake` and `inactive_stake` are `u64`. This sum can overflow if a user has a very large amount of combined active and inactive stake.
 *   **Affected Variables/State**: The local variable `total_stake`. This value is subsequently used to update `self.active_stake = total_stake;` and `self.inactive_stake = 0;`.
 *   **Potential Impact**: If `total_stake` overflows, `self.active_stake` will be set to an incorrect, smaller wrapped-around value. This would underrepresent the user's actual stake, impacting their voting power in governance and potentially their eligibility for or amount of staking rewards or rebates that are stake-dependent.
+*   **Relation to CALC-004/CALC-003**: This is a specific instance where a sum (`active_stake + inactive_stake`) overflows before being assigned. The core risk of `u64` for stake fields is covered by CALC-004, and the direct fund loss from such a sum overflowing during `remove_stake` is detailed in CALC-003. If this overflow in `update()` doesn't lead to a CALC-003 scenario elsewhere, the impact is primarily incorrect stake accounting affecting governance/rebates, or DoS if subsequent operations panic.
 
 ---
 
 ### **CALC-009: `Account::add_stake()` u64 Overflows**
 
 *   **Module & Function**: `account.move` (within `pool` module) - `Account::add_stake()`
-*   **Potential Issue**: This function has two potential `u64` overflows:
-    1.  `let total_stake = self.active_stake + self.inactive_stake;` can overflow, as described in CALC-008.
-    2.  `self.inactive_stake = self.inactive_stake + stake_amount;` can overflow if a user adds a large `stake_amount` to their existing `inactive_stake`.
-*   **Affected Variables/State**:
-    1.  The local `total_stake` variable, which might be used in subsequent logic within the function not shown in the provided snippet (e.g., checks against a maximum total stake).
-    2.  `self.inactive_stake`.
+*   **Potential Issue**: This function has potential `u64` overflows:
+    1.  `let total_stake = self.active_stake + self.inactive_stake;` can overflow.
+    2.  `self.inactive_stake = self.inactive_stake + stake_amount;` can overflow.
+    3.  The call `self.owed_balances.add_deep(stake_amount)` can overflow if `owed_balances.deep` is already large (this is an instance of CALC-004).
+*   **Affected Variables/State**: `self.inactive_stake`, `self.owed_balances.deep_balance`.
 *   **Potential Impact**:
-    1.  If `total_stake` overflows and is used for validation (e.g., `assert!(total_stake + stake_amount <= MAX_USER_STAKE)`), the validation might pass incorrectly, potentially allowing a user to stake more than a theoretical limit if not for the overflow.
-    2.  If `self.inactive_stake` overflows, the user's recorded inactive stake will be incorrect (lower), potentially leading to issues when this stake is meant to become active or is withdrawn. This could result in a loss of a portion of the staked amount or incorrect accounting for staking rewards.
+    1.  Overflow of `total_stake`: Incorrect validation if used for pre-check against a max total stake.
+    2.  Overflow of `self.inactive_stake`: Incorrect accounting of inactive stake.
+    3.  Overflow in `add_deep`: Transaction panics (DoS for staking).
+*   **Relation to CALC-004/CALC-003**: The fundamental issue is the use of `u64` for stake and balance fields (CALC-004). The direct fund loss risk from `active_stake + inactive_stake` overflowing during `remove_stake` is CALC-003. Here, an overflow in `add_deep` would cause a DoS. Overflows in `inactive_stake` or `total_stake` primarily lead to incorrect accounting unless they trigger a DoS or the CALC-003 scenario upon unstaking.
 
 ---
 
-### **CALC-010: `governance::adjust_vote` u64 Overflow/Underflow**
+### **CALC-010: `governance::adjust_vote` u64 Overflow/Underflow for `proposal.votes`**
 
-*   **Module & Function**: `governance.move` (within `pool` module) - `governance::adjust_vote()`
-*   **Potential Issue**:
-    *   **Underflow**: `proposal.votes_for -= votes_to_remove` or `proposal.votes_against -= votes_to_remove` can underflow if `votes_to_remove` (derived from user's previous vote power) is greater than the current `proposal.votes_for` or `proposal.votes_against`. This shouldn't happen in normal logic if a user is only removing their own previous vote, but could occur if state is inconsistent or if `votes_to_remove` is miscalculated.
-    *   **Overflow**: `proposal.votes_for += votes_to_add` or `proposal.votes_against += votes_to_add` can overflow if the total votes for or against a proposal become extremely large.
-*   **Affected Variables/State**: `proposal.votes_for`, `proposal.votes_against` within the `Proposal` struct.
-*   **Potential Impact**:
-    *   **Underflow**: Would cause a panic, potentially reverting the transaction. This could prevent users from changing their votes or unvoting if the proposal's vote counts are already low (possibly due to other users unvoting).
-    *   **Overflow**: Would lead to incorrect vote counts for a proposal (wrapped to a smaller value). This could change the outcome of a governance vote, potentially allowing a proposal to pass or fail incorrectly.
+*   **Module & Function**: `deepbook::state::governance::adjust_vote`
+*   **Affected Variables/State**: `Proposal::votes` (u64), `Governance::next_trade_params`.
+*   **Potential Issue & Exploit Path Confirmation**:
+    *   **Underflow**: `proposal.votes = proposal.votes - votes;` can panic if `votes` (current voting power of the user changing their vote, derived from `stake_to_voting_power(stake_amount)`) is greater than `proposal.votes` (current total votes for the proposal being un-voted).
+        *   **Scenario**: User U with stake S1 (contributing `vp_old_contrib = stake_to_voting_power(S1)`) votes for Proposal P1. `P1.votes` becomes `vp_old_contrib + other_votes`. User U then significantly increases their stake to S2 (now `stake_amount` for `adjust_vote` call, new contribution `vp_new_contrib = stake_to_voting_power(S2)`). User U then decides to change their vote from P1 to P2. When removing the vote from P1, `adjust_vote` is called with `vote_type = UnVoted` and `stake_amount = S2`. The `votes` to subtract will be `vp_new_contrib`. The operation `P1.votes = (vp_old_contrib + other_votes) - vp_new_contrib` will panic if `vp_new_contrib > vp_old_contrib + other_votes`. This is likely if `other_votes` is small and `vp_new_contrib` (from S2) is substantially larger than `vp_old_contrib` (from S1).
+        *   **Consequence**: A user who increases their stake *after* voting for a proposal might be unable to change their vote (remove it from the original proposal) if their new voting power is much larger than their old one and the proposal has few other votes.
+    *   **Overflow**: `proposal.votes = proposal.votes + votes;` can panic if the sum exceeds `u64::MAX`. This can happen if a proposal receives a very large number of votes or votes from stakers with very high individual voting power.
+*   **Ultimate Impact**:
+    *   **DoS**: Panics can prevent users from changing votes or new votes from being registered if they trigger overflow/underflow. This could manipulate governance outcomes by preventing further voting changes or disincentivizing participation.
+    *   Incorrect `next_trade_params`: If a winning proposal loses quorum due to an underflow panic preventing vote removal, or fails to achieve quorum due to an overflow panic preventing vote addition, the `next_trade_params` might not reflect the true desired outcome.
+*   **Mitigations**:
+    *   Move's default panic on overflow/underflow prevents silent corruption.
+    *   **Missing/Insufficient**: `Proposal::votes` should ideally be `u128` to accommodate sums of many `u64` voting powers. For subtraction, the logic should ensure that the `votes` value subtracted corresponds to the actual voting power the user contributed to *that specific proposal at the time of their original vote*, rather than their current total voting power. This would require storing more granular vote information (e.g., a receipt per vote or tracking individual vote contributions). Alternatively, `saturating_sub` could prevent panic but might lead to `proposal.votes` becoming zero prematurely if a user with large current voting power unvotes a proposal they previously voted for with smaller power.
 
 ---
 
-### **CALC-011: `governance::adjust_voting_power` u64 Overflow/Underflow**
+### **CALC-011: `governance::adjust_voting_power` u64 Overflow/Underflow for `self.voting_power`**
 
-*   **Module & Function**: `governance.move` (within `pool` module) - `governance::adjust_voting_power()`
-*   **Potential Issue**: This function modifies `self.voting_power` (a `u64`) by adding or subtracting `stake_amount`.
-    *   `self.voting_power -= stake_amount` can underflow if `stake_amount` is greater than `self.voting_power`. This could happen if a user unstakes more than their current voting power reflects (e.g., due to partial unstaking or if voting power was already zero).
-    *   `self.voting_power += stake_amount` can overflow if a user stakes a very large amount or if their accumulated voting power is already close to the `u64` limit.
-*   **Affected Variables/State**: `governance_state.voting_power` within the `GovernanceState` struct (assuming `self` refers to `GovernanceState`).
-*   **Potential Impact**:
-    *   **Underflow**: Would cause a panic, reverting staking or unstaking operations. Could prevent users from unstaking if their voting power is somehow less than the amount they are trying to unstake.
-    *   **Overflow**: Would result in the user having an incorrect (much lower) voting power, diminishing their influence in governance votes.
+*   **Module & Function**: `deepbook::state::governance::adjust_voting_power`
+*   **Affected Variables/State**: `Governance::voting_power` (u64), and consequently `Governance::quorum`.
+*   **Potential Issue & Exploit Path Confirmation**:
+    *   The calculation is `self.voting_power = self.voting_power + stake_to_voting_power(stake_after) - stake_to_voting_power(stake_before);`. Let `vp_current = self.voting_power`, `vp_new_contrib = stake_to_voting_power(stake_after)`, `vp_old_contrib = stake_to_voting_power(stake_before)`. The effective operation is `vp_current + (vp_new_contrib - vp_old_contrib)`.
+    *   **Overflow**: Can occur if `vp_new_contrib > vp_old_contrib` and `vp_current + (vp_new_contrib - vp_old_contrib)` exceeds `u64::MAX`. This is possible if total voting power is already high and a user significantly increases their stake, leading to a large positive net change in voting power.
+    *   **Underflow**: Can occur if `vp_old_contrib > vp_new_contrib` and `vp_old_contrib - vp_new_contrib > vp_current`. This means the amount of voting power being removed is greater than the current total voting power. This is highly likely if a user with a very large stake (whose `vp_old_contrib` forms a significant portion of `vp_current`) unstakes most or all of their funds (making `vp_new_contrib` small or zero). The subtraction `vp_current - (vp_old_contrib - vp_new_contrib)` would then underflow.
+*   **Ultimate Impact**:
+    *   **DoS**: Panics during `adjust_voting_power` (called by `Account::add_stake` and `Account::remove_stake` via `state.move`) would prevent users from staking or unstaking if their operation triggers the overflow/underflow. This is a significant issue as it can lock user funds or prevent participation.
+    *   **Incorrect Quorum**: If `voting_power` became corrupted due to wrap-around (though panics prevent this by default), the `quorum` calculation (`voting_power / 2`) for subsequent epochs would be incorrect, undermining governance.
+*   **Mitigations**:
+    *   Move's default panic on overflow/underflow.
+    *   **Missing/Insufficient**: `Governance::voting_power` should ideally be `u128` to prevent overflow/underflow from the sum/difference of many `u64` voting power contributions. The arithmetic should be performed using `u128` for intermediate calculations before any necessary casting. For instance, `(vp_current.as_u128() + vp_new_contrib.as_u128() - vp_old_contrib.as_u128()).as_u64()`, with appropriate checks for final casting if `voting_power` remains `u64`. Using `u128` for `Governance::voting_power` itself is the most robust solution.
 
 ---
 
@@ -145,9 +198,71 @@ This section details potential vulnerabilities related to arithmetic operations,
 
 ### **CALC-013: `history::update_historic_median` u128 Median Sum Overflow**
 
-*   **Module & Function**: `history.move` (within `pool` module) - `history::update_historic_median()` calls `math::median<u128>()`
-*   **Potential Issue**: The `math::median` function, when calculating the median for an even number of elements, involves summing two central elements: `(v[mid - 1] + v[mid]) / 2`. If `v` is a vector of `u128` (in this case, `historic_volumes` from the last N epochs), the sum `v[mid - 1] + v[mid]` can overflow the `u128` limit if two consecutive historic epoch volumes are exceptionally large.
-*   **Affected Variables/State**: The calculation of `historic_median` within the `EpochHistory` struct.
-*   **Potential Impact**: An overflow would lead to an incorrect (much smaller, wrapped-around) sum before the division by 2, resulting in a significantly wrong `historic_median` value. Since the `historic_median` is used in `calculate_rebate_amount` (see CALC-005), an incorrect median could lead to users receiving vastly incorrect rebate amounts (either too high, potentially draining rebate funds, or too low).
+*   **Module & Function**: `history.move` (within `pool` module) - `history::update_historic_median()` calls `math::median<u128>()`.
+*   **Potential Issue**: The `math::median` function, when calculating the median for an even number of elements, involves summing two central elements: `(v[mid - 1] + v[mid]) / 2`. If `v` is a vector of `u128` (historic epoch total volumes), this sum could theoretically overflow `u128`.
+*   **Affected Variables/State**: The calculation of `historic_median` within `GlobalHistory` (as `update_historic_median` is called on `global_history`).
+*   **Severity**: **Low Severity / Not Practically Exploitable**
+*   **Analysis & Exploit Path Confirmation**: For the sum `sorted_v[n / 2 - 1] + sorted_v[n / 2]` to overflow `u128`, both `sorted_v[n / 2 - 1]` and `sorted_v[n / 2]` (which are individual epoch total volumes) would need to be exceedingly large, specifically each approaching `u128::MAX / 2`. As established in CALC-006, it's practically impossible for the total volume of a single epoch to reach such magnitudes. Therefore, the sum of two such epoch volumes overflowing `u128` is also practically impossible.
+*   **Impact (Theoretical)**: If an overflow were to occur, it would cause a panic during the median calculation at epoch turnover (when `update_historic_median` is called). This could halt updates to `global_history.historic_median`, potentially affecting any logic that relies on it (e.g., if future rebate calculations were to use this global median).
+*   **Mitigations**: The primary mitigation is the sheer size of `u128`, making the prerequisite individual epoch volumes practically unattainable. A theoretically safer summation method like `a/2 + b/2` (with appropriate scaling if precision is needed) is possible but likely an over-optimization given the practical infeasibility. Standard panic on overflow.
+
+---
+
+### **CALC-014: `deep_price::calculate_order_deep_price` Division by Zero**
+
+*   **Module & Function**: `deepbook::deep_price::calculate_order_deep_price`
+*   **Potential Issue**: Potential division by zero in the calculation `deep_per_asset = cumulative_asset / asset_length` if `asset_length` could be zero.
+*   **Affected Variables/State**: The return value `deep_per_asset`.
+*   **Potential Impact (if not mitigated)**: A division by zero would cause a panic, leading to a Denial of Service (DoS) for any operation that tries to calculate the DEEP price oracle (e.g., fee calculations).
+*   **Status**: **Mitigated by existing checks**
+*   **Analysis & Mitigation Explanation**:
+    *   The function first asserts `assert!(self.last_insert_timestamp(true) > 0 || self.last_insert_timestamp(false) > 0, Errors::ENoDataPoints)`, which ensures that at least one of the price vectors (`base_prices` or `quote_prices`) has had data inserted at some point and is non-empty.
+    *   The logic to determine which asset's cumulative price to use is: `let is_base_conversion = self.last_insert_timestamp(false) == 0 || (self.last_insert_timestamp(true) > 0 && self.last_insert_timestamp(true) > self.last_insert_timestamp(false));` (Note: The actual code uses this logic to determine which price to use if both exist, ensuring it picks one that has data).
+    *   If `is_base_conversion` is true (meaning `base_prices` will be used):
+        *   `cumulative_asset = self.cumulative_base();`
+        *   `asset_length = self.base_prices.length();`
+        *   The `ENoDataPoints` assert ensures `base_prices` is non-empty if it's selected (especially if `quote_prices` is empty or its last timestamp is older). The `add_price_point` logic ensures that if `base_prices` has entries, its length is `> 0` (it prunes to `MAX_DATA_POINTS` but doesn't empty a list that was full). Thus, `asset_length > 0`.
+    *   If `is_base_conversion` is false (meaning `quote_prices` will be used):
+        *   `cumulative_asset = self.cumulative_quote();`
+        *   `asset_length = self.quote_prices.length();`
+        *   Similarly, the `ENoDataPoints` assert ensures `quote_prices` is non-empty if it's selected (because `last_insert_timestamp(false)` would be `> 0`). Thus, `asset_length > 0`.
+    *   The `ENoDataPoints` assert, combined with the logic for choosing which price vector's data to use, effectively ensures that `asset_length` will be greater than zero because an empty vector would not be chosen if a non-empty one exists, and the assert guarantees at least one is non-empty.
+
+---
+
+## Logic and State Vulnerabilities
+
+This section details potential vulnerabilities related to flawed business logic, state management inconsistencies, or unexpected state transitions.
+
+---
+
+### **LIV-001: Panic in `deep_price::add_price_point` Pruning Loop**
+
+*   **Module & Function**: `deepbook::deep_price::add_price_point`
+*   **Affected Variables/State**: The `DeepPrice` object's `base_prices` or `quote_prices` vectors.
+*   **Potential Issue**: The `while` loop responsible for pruning old or excess price data points can attempt to access `asset_prices[0]` when `asset_prices` has become empty due to previous `asset_prices.remove(0)` calls within the same loop. This occurs if multiple conditions for removal are met sequentially, emptying the vector before the loop condition re-evaluates its first clause (`asset_prices.length() > MAX_DATA_POINTS`).
+*   **Exploit Path Confirmation**:
+    1.  Precondition: `MAX_DATA_POINTS` is set (e.g., to 1 for testing, or 100 in production).
+    2.  Scenario:
+        *   Assume `is_base_conversion` is true. `base_prices` (aliased as `asset_prices` in the loop) initially contains `MAX_DATA_POINTS` entries. All these entries are old enough such that `asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp` is true for each of them if they were at index 0.
+        *   A new price point is added, so `asset_prices.push_back(new_price_data)`. Now, `asset_prices.length()` is `MAX_DATA_POINTS + 1`.
+        *   The `while` loop starts: `while (asset_prices.length() > MAX_DATA_POINTS || (asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp))`.
+        *   **First Iteration**: `asset_prices.length() > MAX_DATA_POINTS` (e.g., 101 > 100) is true. The loop body executes. `asset_prices.remove(0)` is called. `asset_prices.length()` is now `MAX_DATA_POINTS` (e.g., 100).
+        *   **Loop Condition Re-evaluation**: `asset_prices.length() > MAX_DATA_POINTS` (100 > 100) is false.
+        *   The second part of the OR condition is evaluated: `(asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp)`. This accesses `asset_prices[0]`.
+        *   **Subsequent Iterations (Problematic Case)**: If *all* the original `MAX_DATA_POINTS` entries were also old enough to be pruned by the *second* condition:
+            *   The loop continues because `asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp` is true.
+            *   `asset_prices.remove(0)` is called repeatedly.
+            *   If this happens `MAX_DATA_POINTS` times, `asset_prices` becomes empty.
+            *   The `while` loop condition is checked again: `asset_prices.length() > MAX_DATA_POINTS` (0 > 100) is false.
+            *   The second part of the OR condition `(asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp)` attempts to access `asset_prices[0]` on an **empty vector**.
+            *   This results in a panic (vector access out of bounds).
+*   **Ultimate Impact**: Denial of Service (DoS) for the `pool::add_deep_price_point` function. This prevents the oracle price for the affected asset (base or quote) from being updated. Consequently, fee calculations relying on this oracle may become stale and inaccurate.
+*   **Mitigations**:
+    *   The loop condition should explicitly check `!asset_prices.is_empty()` *before* attempting to access `asset_prices[0]`. A robust condition would be:
+        `while ((asset_prices.length() > MAX_DATA_POINTS && !asset_prices.is_empty()) || (!asset_prices.is_empty() && asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp))`
+        A simpler, correct form:
+        `while (!asset_prices.is_empty() && (asset_prices.length() > MAX_DATA_POINTS || asset_prices[0].timestamp + MAX_DATA_POINT_AGE_MS < timestamp))`
+    *   Alternatively, an `if (asset_prices.is_empty()) { break; }` check at the very beginning *inside* the loop body would also prevent the panic.
 
 ---
