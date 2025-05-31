@@ -32,33 +32,45 @@ This section details potential vulnerabilities related to arithmetic operations,
 
 ---
 
-### **CALC-003: `Account::remove_stake()` u64 Overflow in DEEP Settlement**
+### **CALC-003: `Account::remove_stake()` - Stake Summation `u64` Overflow Leading to Fund Freeze**
 
-*   **Module & Function**: `account.move` (within `pool` module) - `Account::remove_stake()`
-*   **Potential Issue**: When calculating the total DEEP to return to the user, the function sums `active_stake + inactive_stake`. Both `active_stake` and `inactive_stake` are `u64`. If this sum `active_stake + inactive_stake` overflows the `u64` limit, the `total_deep_to_return` variable passed to `balances::add_deep` will be a smaller, wrapped-around value.
-*   **Affected Variables/State**: The `amount` parameter in the subsequent `balances::add_deep()` call, and ultimately the amount of DEEP tokens returned to the user's `BalanceManager`.
-*   **Potential Impact**: The user would receive fewer DEEP tokens than they are entitled to upon unstaking, leading to a direct loss of user funds (staked DEEP).
+*   **Module & Function**: `deepbook::account::remove_stake` (called by `pool::unstake`)
+*   **Potential Issue**: The sum `stake_before = self.active_stake + self.inactive_stake` will panic if it exceeds `u64::MAX`, because standard Move arithmetic operations panic on overflow.
+*   **Affected Variables/State**: User's ability to unstake DEEP tokens.
+*   **Exploit Path Confirmation**:
+    1.  A user accumulates `active_stake` and `inactive_stake` in their `Account` struct such that the sum of these two `u64` values would exceed `u64::MAX`.
+    2.  The user calls `pool::unstake(pool, account_cap, amount_to_unstake)`. This, in turn, calls `account::remove_stake`.
+    3.  Inside `account::remove_stake`, the operation `self.active_stake + self.inactive_stake` is performed to determine `stake_before`.
+    4.  If this sum exceeds `u64::MAX`, the transaction panics due to arithmetic overflow.
+*   **Ultimate Impact**: **Critical Severity**. The transaction attempting to unstake funds reverts. The user is **unable to unstake any portion of their DEEP tokens** if their total combined active and inactive stake reaches this threshold. This results in a permanent freeze of their staked DEEP, which is equivalent to a loss of access to those funds.
+*   **Mitigations**:
+    *   **Primary**: Change `Account::active_stake`, `Account::inactive_stake` to `u128`. The local variable `stake_before` in `remove_stake` should also become `u128`. Consequently, `Account::settled_balances` (a `Balances` struct) would need its `deep` field to be `u128`, and `Balances::add_deep` would need to accept `u128`. This is the most robust solution.
+    *   **Alternative (less ideal, more complex)**: Keep stake fields as `u64`. In `remove_stake`, perform the sum into a `u128` local variable: `let stake_before_u128 = (self.active_stake as u128) + (self.inactive_stake as u128);`. Then, before calling `self.settled_balances.add_deep(stake_before_u64)`, check if `stake_before_u128 > (MAX_U64 as u128)`. If it is, the contract would need a special mechanism to handle this (e.g., allow partial unstaking up to what `settled_balances` can handle if it remains `u64`, or a multi-stage withdrawal). However, simply panicking, while preventing state corruption from wrap-around, leads to the fund freeze. The ideal solution is to use `u128` throughout for stake and balance accounting.
 
 ---
 
-### **CALC-004: `Balances::add_balances` u64 Overflow (Core Issue for Stake Accumulation)**
+### **CALC-004: `Balances::add_balances` (and helpers) u64 Overflow leading to DoS**
 
-*   **Module & Function**: `deepbook::balances::add_balances` (and helpers `add_base`, `add_quote`, `add_deep`). Also impacts multiple functions in `deepbook::account` that call these (e.g., `process_maker_fill`, `add_settled_balances`, `add_owed_balances`, `claim_rebates`, `add_stake`, `remove_stake`).
-*   **Potential Issue**: Direct `u64 + u64` addition for `base`, `quote`, or `deep` fields within the `Balances` struct can overflow if the sum exceeds `u64::MAX`. This is a general issue affecting many balance update operations.
-*   **Affected Variables/State**: `Balances::base_total`, `Balances::quote_total`, `Balances::deep_total`. Also `AccountBalances` fields within `BalanceManager`, and `Account::active_stake`, `Account::inactive_stake`, `Account::settled_balances`, `Account::owed_balances`.
+*   **Module & Function**:
+    *   `deepbook::balances::add_balances`, `add_base`, `add_quote`, `add_deep`.
+    *   Called by various `deepbook::account` functions: `process_maker_fill`, `add_settled_balances` (in `process_cancel`, `process_modify`), `add_owed_balances` (in `state::process_create`), `claim_rebates`, `add_stake`, `remove_stake`.
+*   **Potential Issue**: Direct `u64 + u64` addition for `base`, `quote`, or `deep` fields within the `Balances` struct (used by `Account` fields like `settled_balances`, `owed_balances`, `unclaimed_rebates`) can overflow if the sum exceeds `u64::MAX`. Standard Move arithmetic operations panic on overflow.
+*   **Affected Variables/State**: `Balances::base`, `Balances::quote`, `Balances::deep` fields within `Account` (e.g., `settled_balances`, `owed_balances`, `unclaimed_rebates`).
 *   **Exploit Path Confirmation & Impact**:
-    *   **General DoS**: If any balance component (e.g., `settled_balances.base` in `Account`) is close to `u64::MAX`, and a transaction attempts to add even a small amount (e.g., via `add_base`) that would cause an overflow, the transaction will panic (due to Move's default overflow checks on `+`). This can lead to a Denial of Service for the affected user for operations that try to update these balances (e.g., receiving fills, claiming rebates, staking). The user might be unable to interact further with the pool for that asset or operation.
-    *   **CALC-003 (Fund Loss via `Account::remove_stake` - Specific instance of CALC-004's broader issue)**:
-        *   **Exploit**:
-            1. A user's `active_stake` and `inactive_stake` in `Account` struct are both `u64`.
-            2. In `account::remove_stake()`, `stake_before = self.active_stake + self.inactive_stake;` is calculated. If `active_stake` is, for example, `u64::MAX - 100` and `inactive_stake` is `200`, their sum overflows `u64` and wraps around to a small value (e.g., `99`).
-            3. This wrapped-around, small `stake_before` value is then passed to `self.settled_balances.add_deep(stake_before)`.
-            4. The `Balances::add_deep` function itself might not overflow here if `settled_balances.deep` was small, but it's adding the *wrong, much smaller* amount to the user's settled DEEP balance.
-        *   **Ultimate Impact (CALC-003)**: When the user subsequently withdraws their funds from `BalanceManager` (which reads from these `settled_balances`), the `Vault` will only transfer this small, wrapped-around DEEP amount from `settled_balances` to their `BalanceManager`. This results in a **direct and permanent loss of the majority of the user's staked DEEP tokens**. Any user whose total stake (`active + inactive`) approaches or exceeds `u64::MAX` is vulnerable when calling `remove_stake`.
-        *   **Attacker Capability (CALC-003)**: This can be triggered by the user themselves when unstaking if their stake is sufficiently large. An attacker cannot directly cause this for another user unless they can influence the victim's stake amounts to reach overflow conditions prior to the victim calling `remove_stake`.
+    1.  A user's `Account` struct has a `Balances` field (e.g., `settled_balances.base`, `owed_balances.deep`, `unclaimed_rebates.quote`) that accumulates to a value very close to `u64::MAX` through legitimate operations.
+    2.  A subsequent transaction attempts to add a further amount (e.g., `amount_to_add` in `add_base(amount_to_add)`), however small, causing the `+` operation on the `u64` field to exceed `u64::MAX`.
+    3.  **Result**: The transaction panics due to arithmetic overflow.
+    4.  **Ultimate Impact**: **Denial of Service (DoS)** for the specific user operation. Severity is **High/Medium** depending on the criticality of the blocked operation:
+        *   Prevents settlement of new fills for a maker if their `settled_balances` would overflow (`Account::process_maker_fill`).
+        *   Prevents claiming rebates if `unclaimed_rebates.add_balances(rebate_amount)` (or similar direct field addition) overflows (`Account::claim_rebates`).
+        *   Prevents staking if `owed_balances.add_deep(stake_amount)` overflows (`Account::add_stake`).
+        *   Prevents unstaking if `settled_balances.add_deep(stake_before)` overflows (this occurs *after* `stake_before` is calculated; the overflow of `stake_before` itself is CALC-003).
+        *   Prevents order cancellation/modification if the refund amount added to `settled_balances` overflows.
+        *   This makes key functionalities unusable for users with very large accumulated balances in a specific component of their `Account`. It does not cause silent balance corruption due to the panic.
+*   **Attacker Capability**: Primarily user-triggered if their own balances are very large. An attacker might opportunistically grief another user by sending a fill that tips a balance over `u64::MAX`, if the victim's balances are already near the limit.
 *   **Mitigations**:
-    *   Move's panic on overflow is a default safety feature preventing silent corruption, but it leads to DoS in many cases.
-    *   **Missing/Insufficient**: The `base`, `quote`, and `deep` fields within the `Balances` struct (and consequently fields like `active_stake`, `inactive_stake` in `Account` that are summed up before being added to `Balances`) should ideally be `u128` to significantly reduce the likelihood of overflow for token amounts. For sums like `active_stake + inactive_stake` before they are used with `Balances` functions (as in `remove_stake`), the sum should be performed into a `u128` temporary variable to prevent overflow before further processing or before being passed to a `Balances` function that expects a `u64` amount (if `Balances` fields remain `u64`).
+    *   Move's default panic on overflow is a safety feature preventing silent state corruption but results in DoS.
+    *   **Primary**: All fields in `Balances` struct (`base`, `quote`, `deep`) should be `u128` to make overflow highly unlikely for token balances.
 
 ---
 
@@ -129,8 +141,9 @@ This section details potential vulnerabilities related to arithmetic operations,
 *   **Module & Function**: `account.move` (within `pool` module) - `Account::update()`
 *   **Potential Issue**: During an epoch change, this function calculates `let total_stake = self.active_stake + self.inactive_stake;`. Both `active_stake` and `inactive_stake` are `u64`. This sum can overflow if a user has a very large amount of combined active and inactive stake.
 *   **Affected Variables/State**: The local variable `total_stake`. This value is subsequently used to update `self.active_stake = total_stake;` and `self.inactive_stake = 0;`.
-*   **Potential Impact**: If `total_stake` overflows, `self.active_stake` will be set to an incorrect, smaller wrapped-around value. This would underrepresent the user's actual stake, impacting their voting power in governance and potentially their eligibility for or amount of staking rewards or rebates that are stake-dependent.
-*   **Relation to CALC-004/CALC-003**: This is a specific instance where a sum (`active_stake + inactive_stake`) overflows before being assigned. The core risk of `u64` for stake fields is covered by CALC-004, and the direct fund loss from such a sum overflowing during `remove_stake` is detailed in CALC-003. If this overflow in `update()` doesn't lead to a CALC-003 scenario elsewhere, the impact is primarily incorrect stake accounting affecting governance/rebates, or DoS if subsequent operations panic.
+*   **Potential Impact**: If the sum `self.active_stake + self.inactive_stake` overflows `u64`, the transaction panics. This leads to a **DoS for epoch updates for this specific user's account**. Their stake cannot be rolled over from inactive to active. Incorrect accounting (due to wrap-around) is prevented by the panic.
+*   **Relation to CALC-004/CALC-003**: This is a specific instance where a sum (`active_stake + inactive_stake`) overflows. The core risk of `u64` for stake fields is covered by CALC-004. Unlike CALC-003 (fund freeze in `remove_stake`), the immediate impact here is DoS for the `Account::update` operation for that user.
+*   **Mitigations**: `Account::active_stake` and `Account::inactive_stake` should be `u128`, and the sum performed into a `u128` local variable.
 
 ---
 
@@ -138,15 +151,12 @@ This section details potential vulnerabilities related to arithmetic operations,
 
 *   **Module & Function**: `account.move` (within `pool` module) - `Account::add_stake()`
 *   **Potential Issue**: This function has potential `u64` overflows:
-    1.  `let total_stake = self.active_stake + self.inactive_stake;` can overflow.
-    2.  `self.inactive_stake = self.inactive_stake + stake_amount;` can overflow.
-    3.  The call `self.owed_balances.add_deep(stake_amount)` can overflow if `owed_balances.deep` is already large (this is an instance of CALC-004).
-*   **Affected Variables/State**: `self.inactive_stake`, `self.owed_balances.deep_balance`.
-*   **Potential Impact**:
-    1.  Overflow of `total_stake`: Incorrect validation if used for pre-check against a max total stake.
-    2.  Overflow of `self.inactive_stake`: Incorrect accounting of inactive stake.
-    3.  Overflow in `add_deep`: Transaction panics (DoS for staking).
-*   **Relation to CALC-004/CALC-003**: The fundamental issue is the use of `u64` for stake and balance fields (CALC-004). The direct fund loss risk from `active_stake + inactive_stake` overflowing during `remove_stake` is CALC-003. Here, an overflow in `add_deep` would cause a DoS. Overflows in `inactive_stake` or `total_stake` primarily lead to incorrect accounting unless they trigger a DoS or the CALC-003 scenario upon unstaking.
+    1.  `let total_stake = self.active_stake + self.inactive_stake;` can panic if the sum exceeds `u64::MAX`.
+    2.  `self.inactive_stake = self.inactive_stake + stake_amount;` can panic if this sum exceeds `u64::MAX`.
+    3.  The call `self.owed_balances.add_deep(stake_amount)` can panic if `owed_balances.deep + stake_amount` exceeds `u64::MAX` (this is an instance of CALC-004).
+*   **Affected Variables/State**: `self.inactive_stake`, `self.owed_balances.deep_balance`, user's ability to stake.
+*   **Potential Impact**: Panics if sums like `active_stake + inactive_stake` or `inactive_stake + stake_amount` overflow `u64`. This leads to **DoS for new staking operations (CALC-009) or for epoch updates for the user (related to CALC-008 logic if sum overflows there)**. Incorrect accounting due to wrap-around is prevented by the panic.
+*   **Mitigations**: Stake fields (`active_stake`, `inactive_stake`) and intermediate sums should use `u128`. `Balances::deep` (in `owed_balances`) should also be `u128` (see CALC-004).
 
 ---
 
